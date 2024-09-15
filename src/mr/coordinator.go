@@ -231,10 +231,12 @@ func (c *Coordinator) Done() bool {
 	return c.isDone
 }
 
-// 每隔5秒检查是否有任务超时，将超时的任务分配给空闲队列
+// 每隔1秒检查是否有任务超时，将超时的任务分配给空闲队列
 func (c *Coordinator) findTaskTimeout() {
 	for {
-		time.Sleep(time.Second * 5)
+		// 这里有个坑点 如果设置的轮询时间过高比如5秒，最后一个crash test过不去
+		// 因为最后一个测试会把worker的进程crash掉，然后coordinator检查超时太慢就会测试失败。
+		time.Sleep(time.Second)
 		mapTask := c.inProgressMapTasks.TimeOut()
 		if len(mapTask) > 0 {
 			for _, task := range mapTask {

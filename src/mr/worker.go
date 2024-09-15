@@ -1,10 +1,16 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"time"
 )
 
@@ -84,6 +90,11 @@ func CallTask() *TaskState {
 	return &reply
 }
 
+func CallTaskDone(task *TaskState) {
+	reply := ExampleReply{}
+	call("Coordinator.TaskDone", task, &reply)
+}
+
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
@@ -106,8 +117,114 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 }
 
 func workerMap(mapf func(string, string) []KeyValue, task *TaskState) {
+	log.Printf("workerMap task %vth file %s\n", task.MapIndex, task.FileName)
 
+	intermediate := []KeyValue{}
+	file, err := os.Open(task.FileName)
+	if err != nil {
+		log.Fatalf("workerMap open file %s error %v\n", task.FileName, err)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("workerMap read file %s error %v\n", task.FileName, err)
+	}
+	file.Close()
+
+	kva := mapf(task.FileName, string(content))
+	intermediate = append(intermediate, kva...)
+
+	nR := task.R
+	outprefix := "mr-tmp/mr-"
+	outprefix += strconv.Itoa(task.MapIndex)
+	outprefix += "-"
+
+	outFiles := make([]*os.File, nR)
+	fileEncoders := make([]*json.Encoder, nR)
+	for i := 0; i < nR; i++ {
+		outFiles[i], _ = os.CreateTemp("mr-tmp", "mr-tmp-*")
+		fileEncoders[i] = json.NewEncoder(outFiles[i])
+	}
+
+	for _, kv := range intermediate {
+		i := ihash(kv.Key) % nR
+		enc := fileEncoders[i]
+		// 把key-value对写入对应的reduce文件
+		err := enc.Encode(&kv)
+		if err != nil {
+			log.Printf("workerMap encode key %s value %s error %v\n", kv.Key, kv.Value, err)
+			panic("workerMap encode error")
+		}
+	}
+
+	for i, file := range outFiles {
+		outname := outprefix + strconv.Itoa(i)
+		oldpath := filepath.Join(file.Name())
+
+		os.Rename(oldpath, outname)
+		file.Close()
+	}
+
+	CallTaskDone(task)
 }
 
 func workerReduce(reducef func(string, []string) string, task *TaskState) {
+	log.Printf("workerReduce task %vth file %s\n", task.ReduceIndex, task.FileName)
+
+	outname := "mr-out-" + strconv.Itoa(task.ReduceIndex)
+
+	innamepredix := "mr-tmp/mr-"
+	innamesuffix := "-" + strconv.Itoa(task.ReduceIndex)
+
+	intermediate := []KeyValue{}
+	for i := 0; i < task.M; i++ {
+		inname := innamepredix + strconv.Itoa(i) + innamesuffix
+		file, err := os.Open(inname)
+		if err != nil {
+			log.Printf("workerReduce open file %s error %v\n", inname, err)
+			continue
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+
+	ofile, err := os.CreateTemp("mr-tmp", "mr-*")
+	if err != nil {
+		log.Printf("workerReduce create file %s error %v\n", outname, err)
+		panic("workerReduce create file error")
+	}
+
+	i := 0
+	// 为什么这里不直接使用全部的key的value累加成一个字符串数组
+	// 因为hash冲突的原因，可能有不相同的key，所以需要判断要累加的key是否相同
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	os.Rename(filepath.Join(ofile.Name()), outname)
+	ofile.Close()
+
+	CallTaskDone(task)
 }
